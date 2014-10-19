@@ -7,26 +7,20 @@ import java.awt.event.KeyListener;
 import java.awt.event.WindowEvent;
 import java.awt.event.WindowListener;
 import java.io.IOException;
+import java.util.Arrays;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 
 public class SextetStreamStdoutTest implements KeyListener, WindowListener {
 
-    // This mapping is biased toward the US QWERTY keyboard
-    private final int[] keycodesForStates = new int[]{
-        KeyEvent.VK_0, KeyEvent.VK_1, KeyEvent.VK_2, KeyEvent.VK_3, KeyEvent.VK_4, KeyEvent.VK_5, KeyEvent.VK_6, KeyEvent.VK_7, KeyEvent.VK_8, KeyEvent.VK_9,
-        KeyEvent.VK_ESCAPE, KeyEvent.VK_F1, KeyEvent.VK_F2, KeyEvent.VK_F3, KeyEvent.VK_F4, KeyEvent.VK_F5, KeyEvent.VK_F6, KeyEvent.VK_F7, KeyEvent.VK_F8, KeyEvent.VK_F9,
-        KeyEvent.VK_F10, KeyEvent.VK_F11, KeyEvent.VK_F12, KeyEvent.VK_INSERT, KeyEvent.VK_HOME, KeyEvent.VK_PAGE_UP, KeyEvent.VK_DELETE, KeyEvent.VK_END, KeyEvent.VK_PAGE_DOWN, KeyEvent.VK_ENTER,
-        KeyEvent.VK_Q, KeyEvent.VK_W, KeyEvent.VK_E, KeyEvent.VK_R, KeyEvent.VK_T, KeyEvent.VK_Y, KeyEvent.VK_U, KeyEvent.VK_I, KeyEvent.VK_O, KeyEvent.VK_P,
-        KeyEvent.VK_A, KeyEvent.VK_S, KeyEvent.VK_D, KeyEvent.VK_F, KeyEvent.VK_G, KeyEvent.VK_H, KeyEvent.VK_J, KeyEvent.VK_K, KeyEvent.VK_L, KeyEvent.VK_SEMICOLON,
-        KeyEvent.VK_Z, KeyEvent.VK_X, KeyEvent.VK_C, KeyEvent.VK_V, KeyEvent.VK_B, KeyEvent.VK_N, KeyEvent.VK_M, KeyEvent.VK_COMMA, KeyEvent.VK_SLASH, KeyEvent.VK_TAB,
-        KeyEvent.VK_UP, KeyEvent.VK_RIGHT, KeyEvent.VK_DOWN, KeyEvent.VK_LEFT
-    };
+    private final boolean[] states = new boolean[65536];
 
-    private final boolean[] states = new boolean[keycodesForStates.length];
+	private static final int sextetsNeeded(int bitCount) {
+		return ((bitCount + 5) / 6);
+	}
 
-    private final int SEXTETS_NEEDED_FOR_STATE = ((states.length + 5) / 6);
+    private final int SEXTETS_NEEDED_FOR_STATE = sextetsNeeded(states.length + 5);
 
     private int extractSixStates(int startIndex) {
         int result = 0;
@@ -51,13 +45,33 @@ public class SextetStreamStdoutTest implements KeyListener, WindowListener {
         return (byte) (((sextet + 0x10) & 0x3F) + 0x30);
     }
 
+	private int currentStateBitsCount()
+	{
+		int lastTrueIndex;
+		for(lastTrueIndex = states.length - 1; lastTrueIndex >= 0; --lastTrueIndex) {
+			if(states[lastTrueIndex]) {
+				break;
+			}
+		}
+		return lastTrueIndex + 1;
+	}
+
+	private int currentOutputSextetsCount()
+	{
+		// Output must be non-empty.
+		int bitCount = Math.max(1, currentStateBitsCount());
+		return sextetsNeeded(bitCount);
+	}
+
     private byte[] packCurrentStatePlusLF() {
-        byte[] result = new byte[SEXTETS_NEEDED_FOR_STATE + 1];
-        for (int i = 0; i < SEXTETS_NEEDED_FOR_STATE; ++i) {
-            result[i] = printableSextet(extractSixStates(i * 6));
+		int sextetCount = currentOutputSextetsCount();
+        byte[] buffer = new byte[sextetCount + 1];
+        for (int i = 0; i < sextetCount; ++i) {
+			int sextet = extractSixStates(i * 6);
+            buffer[i] = printableSextet(sextet);
         }
-        result[result.length - 1] = 0xA;
-        return result;
+        buffer[buffer.length - 1] = 0xA;
+        return buffer;
     }
 
     @Override
@@ -104,19 +118,9 @@ public class SextetStreamStdoutTest implements KeyListener, WindowListener {
         updateState(ke, false);
     }
 
-    private int lookupStateIndex(int keycode) {
-        int i, len = keycodesForStates.length;
-        for (i = 0; i < len; ++i) {
-            if (keycodesForStates[i] == keycode) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
     private void updateState(KeyEvent ke, boolean newValue) {
-        int stateIndex = lookupStateIndex(ke.getKeyCode());
-        if (stateIndex >= 0 && states[stateIndex] != newValue) {
+        int stateIndex = ke.getKeyCode();
+        if (stateIndex >= 0 && stateIndex <= states.length && states[stateIndex] != newValue) {
             states[stateIndex] = newValue;
             onChange();
         }
@@ -124,8 +128,14 @@ public class SextetStreamStdoutTest implements KeyListener, WindowListener {
 
     private volatile long lastOutputStateTime = 0;
 
-    private synchronized void outputState(boolean automatic, long skipIfLastOutputAfter) {
-        if (!(automatic && (lastOutputStateTime > skipIfLastOutputAfter))) {
+	// Can be called by either the main thread (the key event thread) or the watchdog thread (the thread that forces
+	// output after a period of inactivity), so this is synchronized.
+	//
+	// If fromWatchdog is true, the actual last recorded output must be older than the deadline being handled by the
+	// watchdog loop. If it is newer, that means a key event was handled before the deadline, so the extra output is
+	// suppressed.
+    private synchronized void outputState(boolean fromWatchdog, long skipIfLastOutputAfter) {
+        if (!(fromWatchdog && (lastOutputStateTime > skipIfLastOutputAfter))) {
             lastOutputStateTime = System.currentTimeMillis();
 
             byte[] outputData = packCurrentStatePlusLF();
@@ -139,10 +149,12 @@ public class SextetStreamStdoutTest implements KeyListener, WindowListener {
         }
     }
 
+	// Called by key event thread
     private void outputState() {
         outputState(false, 0);
     }
 
+	// Called by watchdog thread
     private void outputState(long skipIfLastOutputAfter) {
         outputState(true, skipIfLastOutputAfter);
     }
@@ -162,13 +174,13 @@ public class SextetStreamStdoutTest implements KeyListener, WindowListener {
         label.setText(on);
     }
 
-    private static class IdleRepeat implements Runnable {
+    private static class RepeatWatchdog implements Runnable {
 
         SextetStreamStdoutTest host;
         boolean running = true;
         final long interval = 1000;
 
-        public IdleRepeat(SextetStreamStdoutTest host) {
+        public RepeatWatchdog(SextetStreamStdoutTest host) {
             this.host = host;
         }
 
@@ -209,35 +221,35 @@ public class SextetStreamStdoutTest implements KeyListener, WindowListener {
     private final JFrame frame;
     private final Panel panel;
     private final JLabel label;
-    private final IdleRepeat ir;
-    private final Thread irt;
+    private final RepeatWatchdog rwd;
+    private final Thread rwdt;
 
     public SextetStreamStdoutTest() {
         frame = new JFrame("SextetStream Stdout Test");
         frame.addWindowListener(this);
 
         panel = new Panel(new BorderLayout(), this);
-        label = new JLabel("Press keys to change the state (note: numbering is arbitrary).");
+        label = new JLabel("Press keys to change the state (numbering may be arbitrary).");
         label.setHorizontalAlignment(JLabel.LEFT);
         label.setVerticalAlignment(JLabel.TOP);
         panel.add(label);
         frame.add(panel);
         frame.setSize(400, 100);
         frame.setVisible(true);
-        ir = new IdleRepeat(this);
-        irt = new Thread(ir);
+        rwd = new RepeatWatchdog(this);
+        rwdt = new Thread(rwd);
     }
 
     private void go() {
-        irt.start();
+        rwdt.start();
     }
 
     private void shutdown() {
-        ir.running = false;
-        irt.interrupt();
+        rwd.running = false;
+        rwdt.interrupt();
         while (true) {
             try {
-                irt.join();
+                rwdt.join();
                 break;
             } catch (InterruptedException e) {
                 //continue;
